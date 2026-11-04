@@ -63,9 +63,13 @@ Settings are stored in `HKCU\Software\hotswap_re`.
    wake the drive. It only works while the tray applet is running, so enable Autostart.
 3. **Scan for hardware changes repairs the original's leftovers.** Disks or optical drives stuck in
    `CM_PROB_WILL_BE_REMOVED` are cleaned up and re-detected without a reboot.
-   Spindown (on by default) puts the drive in standby before the removal, and the drive stays in standby
-   through the removal. Measured on an ST3250620AS: rescan after a spindown removal takes about 5 s longer
-   than without one, because the drive has to spin up again.
+   Spindown (on by default) puts the drive in standby before the removal. Windows wakes the drive up
+   again while it tears the disk down (storahci turns the disk's final SCSI STOP into a spin-up), and
+   after that the drive can no longer be reached. So the spindown also arms the drive's own standby
+   timer, and the drive spins itself down 5 s after the removal. The timer lasts until the drive loses
+   power; **Scan for hardware changes** turns it off again on disks it brings back. If the drive refuses
+   the spin-down command, you are told so. Sleep and hibernation power the drive up again, which also
+   clears the timer, so after waking the PC a removed drive keeps spinning until it is unplugged.
 3. **No stale device handles.** Nothing is cached. Every menu takes a fresh snapshot of the device tree, and
    the removal re-reads it again and matches the device by its instance ID. If the device went away or was
    re-numbered while the menu was open, you get a "no longer present" message instead of an action on the

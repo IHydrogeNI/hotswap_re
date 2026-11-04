@@ -40,7 +40,7 @@ enum {
     S_X_NOTIFY = S_GEN_COUNT, S_X_WOW64, S_X_GONE, S_X_SYSTEM, S_X_NOTFOUND,
     S_X_BUSY, S_X_VETO, S_X_ABOUT_TEXT, S_X_USAGE_EXTRA, S_X_SELECT_NONHS_DOTS,
     S_X_SYSTEM_TAG, S_X_WORKING, S_X_SCAN_DONE, S_X_CR_ERROR, S_X_OFFLINE_NA,
-    S_X_LIST_TITLE, S_COUNT
+    S_X_LIST_TITLE, S_X_SPIN_FAILED, S_COUNT
 };
 
 static const WCHAR *const g_extStrings[S_COUNT - S_GEN_COUNT] = {
@@ -71,6 +71,7 @@ static const WCHAR *const g_extStrings[S_COUNT - S_GEN_COUNT] = {
     L"Configuration Manager error 0x%02X.",
     L"Offline (Vista or later)",
     L"Detected devices",
+    L"The drive did not accept the spin-down command, so it may keep spinning until it is unplugged.",
 };
 
 static int g_lang; /* 0..NLANG-1 */
@@ -781,25 +782,48 @@ static void SetOffline(int number)
     CloseHandle(h);
 }
 
-/* Spins the drive down: ATA STANDBY IMMEDIATE, or SCSI START STOP UNIT for
-   USB/SCSI bridges that do not pass ATA commands through. */
-static void Spindown(int number)
+/* Sends a non-data ATA command. Returns -1 if the path does not pass ATA
+   commands through at all, 0 if the drive rejected it, 1 if it accepted it
+   (a successful DeviceIoControl alone only means the request reached the controller). */
+static int AtaCommand(HANDLE h, UCHAR cmd, UCHAR count)
 {
     ATA_PASS_THROUGH_EX apt;
+    DWORD br;
+    ZeroMemory(&apt, sizeof apt);
+    apt.Length = sizeof apt;
+    apt.AtaFlags = ATA_FLAGS_DRDY_REQUIRED;
+    apt.TimeOutValue = 10;
+    apt.CurrentTaskFile[1] = count;
+    apt.CurrentTaskFile[6] = cmd;
+    if (!DeviceIoControl(h, IOCTL_ATA_PASS_THROUGH, &apt, sizeof apt, &apt, sizeof apt, &br, NULL))
+        return -1;
+    return !(apt.CurrentTaskFile[7] & 0x21);   /* status register: no ERR, no device fault */
+}
+
+/* Puts the drive in standby before the removal.
+   The removal itself wakes the drive up again: tearing down the disk and volume
+   stacks flushes and powers the disk down with SCSI START STOP UNIT, which storahci
+   turns into a spin-up (measured on an ST3250620AS). After the removal the drive can
+   no longer be reached (its PDO is gone and storport refuses pass-through on the
+   adapter), so STANDBY (E2h) also arms the drive's own standby timer: 5 s after the
+   last command it spins itself down. The timer lasts until the drive loses power;
+   Rescan clears it on disks it brings back.
+   USB/SCSI bridges without ATA pass-through get SCSI START STOP UNIT instead. */
+#define HSR_STANDBY_TIMER 1   /* x 5 s */
+static BOOL Spindown(int number)
+{
     struct {
         SCSI_PASS_THROUGH spt;
         UCHAR sense[32];
     } s;
     DWORD br;
+    int r;
     HANDLE h = OpenPhysical(K_FIXED, number);
-    if (h == INVALID_HANDLE_VALUE) return;
+    if (h == INVALID_HANDLE_VALUE) return FALSE;
 
-    ZeroMemory(&apt, sizeof apt);
-    apt.Length = sizeof apt;
-    apt.AtaFlags = ATA_FLAGS_DRDY_REQUIRED;
-    apt.TimeOutValue = 10;
-    apt.CurrentTaskFile[6] = 0xE0; /* STANDBY IMMEDIATE */
-    if (!DeviceIoControl(h, IOCTL_ATA_PASS_THROUGH, &apt, sizeof apt, &apt, sizeof apt, &br, NULL)) {
+    r = AtaCommand(h, 0xE2, HSR_STANDBY_TIMER);   /* STANDBY + standby timer */
+    if (r == 0) r = AtaCommand(h, 0xE0, 0);         /* STANDBY IMMEDIATE */
+    if (r < 0) {
         ZeroMemory(&s, sizeof s);
         s.spt.Length = sizeof s.spt;
         s.spt.CdbLength = 6;
@@ -808,8 +832,19 @@ static void Spindown(int number)
         s.spt.DataIn = SCSI_IOCTL_DATA_UNSPECIFIED;
         s.spt.TimeOutValue = 10;
         s.spt.Cdb[0] = 0x1B;           /* START STOP UNIT, START=0 */
-        DeviceIoControl(h, IOCTL_SCSI_PASS_THROUGH, &s, sizeof s, &s, sizeof s, &br, NULL);
+        r = DeviceIoControl(h, IOCTL_SCSI_PASS_THROUGH, &s, sizeof s, &s, sizeof s, &br, NULL)
+            && s.spt.ScsiStatus == 0;  /* GOOD */
     }
+    CloseHandle(h);
+    return r > 0;
+}
+
+/* Turns the standby timer armed by Spindown off again (IDLE E3h with count 0). */
+static void DisarmStandbyTimer(int number)
+{
+    HANDLE h = OpenPhysical(K_FIXED, number);
+    if (h == INVALID_HANDLE_VALUE) return;
+    AtaCommand(h, 0xE3, 0);   /* IDLE, standby timer disabled */
     CloseHandle(h);
 }
 
@@ -1040,10 +1075,42 @@ static BOOL CheckWatch(WCHAR *out, int cap)
     return back;
 }
 
+/* Disks that Rescan brings back still have the standby timer armed by Spindown
+   (unless they lost power in between): turn it off, or they would spin down after
+   every 5 s of idle. They may take a moment to show up after the re-enumeration. */
+static void DisarmReturned(WCHAR *ids)
+{
+    int k, i;
+    for (k = 0; k < 10 && *ids; k++) {
+        DEVLIST *L;
+        if (k) Sleep(500);
+        if (!(L = EnumDevices())) return;
+        for (i = 0; i < L->nDev; i++)
+            if (L->dev[i].kind == K_FIXED && MszHas(ids, L->dev[i].selfId)) {
+                DisarmStandbyTimer(L->dev[i].number);
+                MszDel(ids, L->dev[i].selfId);
+            }
+        Free(L);
+    }
+}
+
 static void Rescan(void)
 {
     DEVINST dn, root;
     WCHAR *m = Alloc(MSZ_CAP * sizeof(WCHAR)), *p;
+    WCHAR *ids = Alloc(MSZ_CAP * sizeof(WCHAR));
+    if (ids) {
+        /* Everything we removed earlier: watched disks and the "Removed" list. */
+        if (m) {
+            RegGetMsz(L"Watch", m, MSZ_CAP);
+            for (p = m; *p; p += lstrlenW(p) + 1) {
+                WATCH w;
+                if (ParseWatch(p, &w)) MszAdd(ids, MSZ_CAP, w.id);
+            }
+            RegGetMsz(L"Removed", m, MSZ_CAP);
+            for (p = m; *p; p += lstrlenW(p) + 1) MszAdd(ids, MSZ_CAP, p);
+        }
+    }
     ClearWatch();
     if (m && CM_Locate_DevNodeW(&root, NULL, CM_LOCATE_DEVNODE_NORMAL) == CR_SUCCESS) {
         FindPendingRemovals(root, 0, m, MSZ_CAP);
@@ -1062,6 +1129,10 @@ static void Rescan(void)
     }
     if (CM_Locate_DevNodeW(&root, NULL, CM_LOCATE_DEVNODE_NORMAL) == CR_SUCCESS)
         CM_Reenumerate_DevNode(root, CM_REENUMERATE_SYNCHRONOUS);
+    if (ids) {
+        DisarmReturned(ids);
+        Free(ids);
+    }
 }
 
 /* Removes the device identified by want->targetId / want->selfId. The device
@@ -1080,6 +1151,7 @@ static void RemoveDevice(const DEVENTRY *want, RESULT *r)
     CONFIGRET cr;
     PNP_VETO_TYPE veto;
     ULONG flags;
+    BOOL spinFailed = FALSE;
 
     Label(want, label, 512, FALSE);
     if (!L) {
@@ -1197,7 +1269,7 @@ static void RemoveDevice(const DEVENTRY *want, RESULT *r)
     for (i = 0; i < L->nDev; i++) {
         if (!affected[i] || L->dev[i].kind == K_CDROM) continue;
         if (g_set.offline) SetOffline(L->dev[i].number);
-        if (g_set.spinDown) Spindown(L->dev[i].number);
+        if (g_set.spinDown && !Spindown(L->dev[i].number)) spinFailed = TRUE;
     }
 
     /* Handles must be closed before the query-remove, or they veto it themselves. */
@@ -1232,6 +1304,10 @@ static void RemoveDevice(const DEVENTRY *want, RESULT *r)
             RecordRemoved(e->targetId);
         }
         SetResult(r, R_OK, S_SAFE_TITLE, NULL, S_SAFE_TEXT, label);
+        if (spinFailed) {
+            StrCat(r->text, 1024, L"\n\n");
+            StrCat(r->text, 1024, T(S_X_SPIN_FAILED));
+        }
     } else if (cr == CR_REMOVE_VETOED) {
         int msg;
         switch (veto) {
